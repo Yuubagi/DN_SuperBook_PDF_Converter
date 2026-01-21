@@ -68,7 +68,7 @@ namespace SuperBookTools.App
             string srcDir = vl.DefaultParam.StrValue;
             string dstDir = vl["dst"].StrValue;
 
-            if (srcDir._IsSamei(dstDir) == false)
+            if (srcDir._IsSamei(dstDir))
             {
                 throw new CoresException("srcDir must not be same to dstDir.");
             }
