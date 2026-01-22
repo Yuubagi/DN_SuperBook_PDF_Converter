@@ -1405,16 +1405,20 @@ public static class SuperPdfUtil
         // PDF から画像を抽出
         ImageMagickExtractImageOption extractOptions = new ImageMagickExtractImageOption
         {
-            Format = ImageMagickExtractImageFormat.Bmp,
+            Format = ImageMagickExtractImageFormat.Png,
             NumPages = options.MaxPagesForDebug,
         };
         await SuperBookExternalTools.ImageMagick.ExtractImagesFromPdfAsync(srcPdfPath, pdf_extracted_dir, extractOptions, cancel: cancel);
 
         // 抽出された画像の上下左右 0.5% をトリミングする (スキャンで黒枠などが映っている場合があるため)
-        var bmpFiles = (await Lfs.EnumDirectoryAsync(pdf_extracted_dir, cancel: cancel)).Where(x => x.IsFile && x.Name._IsExtensionMatch(".bmp")).OrderBy(x => x.Name, StrCmpi);
-
-        foreach (var bmpFile in bmpFiles)
+        await foreach (var bmpFile in Lfs.EnumDirectoryAsync(pdf_extracted_dir, cancel: cancel))
         {
+            if (!bmpFile.IsFile) 
+                continue;
+            
+            if (!bmpFile.Name._IsExtensionMatch(".png")) 
+                continue;
+            
             using var srcImage = await SixLabors.ImageSharp.Image.LoadAsync<Rgb24>(bmpFile.FullPath, cancellationToken: cancel);
 
             if (srcImage.Width >= 10 && srcImage.Height >= 10)
@@ -1429,7 +1433,7 @@ public static class SuperPdfUtil
                     ctx.Crop(rect);
                 });
 
-                await srcImage.SaveAsBmpAsync(PP.Combine(pdf_extracted_dir2, PP.GetFileName(bmpFile.FullPath)), cancellationToken: cancel);
+                await srcImage.SaveAsPngAsync(PP.Combine(pdf_extracted_dir2, PP.GetFileName(bmpFile.FullPath)), cancellationToken: cancel);
             }
         }
 
@@ -1542,11 +1546,10 @@ public static class SuperPdfUtil
             Directory.CreateDirectory(dstDir);
         }
 
-        var allSrcImgFiles = Directory.GetFiles(srcDir, "*", SearchOption.TopDirectoryOnly)
-            .Where(x => x._IsExtensionMatch(".bmp .png"))
-            .OrderBy(f => f) // ファイル名順にソート
-            .Take(maxPagesForDebug) // debug
-            .ToList();
+        IEnumerable<string> allSrcImgFiles =
+            Directory.EnumerateFiles(srcDir)
+                .Where(x => x._IsExtensionMatch(".png"))
+                .Take(maxPagesForDebug);
 
         int totalPages = allSrcImgFiles.Count;
         if (totalPages == 0)
@@ -1555,115 +1558,88 @@ public static class SuperPdfUtil
             return null;
         }
 
-        var pageInfos = allSrcImgFiles
-            .Select((filePath, idx) => new PageInfo
-            {
-                FilePath = filePath,
-                PageNumber = idx + 1,
-                IsOdd = ((idx + 1) % 2 == 1)
-            })
-            .ToList();
-
-        var oddGroup = pageInfos.Where(p => p.IsOdd).ToList();
-        var evenGroup = pageInfos.Where(p => !p.IsOdd).ToList();
-
         // ---------------------------------------------------------
-        // (2) 全ページを走査して deskew(傾き補正) → カラー統計抽出 → 一時保存
+        // (2) 全ページを走査して deskew → カラー統計抽出 → 一時保存
+        //      ※ pageInfos / odd / even List を使わない版
         // ---------------------------------------------------------
+        
         var semaphore = new SemaphoreSlim(maxCpu, maxCpu);
         //var semaphore = new SemaphoreSlim(1, 1);
+        
         var colorStatsList_Even = new ConcurrentBag<ColorStats>();
-        var colorStatsList_Odd = new ConcurrentBag<ColorStats>();
-
-        await Task.WhenAll(pageInfos.Select(async page =>
+        var colorStatsList_Odd  = new ConcurrentBag<ColorStats>();
+        
+        var tasks = new List<Task>();
+        
+        int pageNumber = 1;
+        
+        foreach (var filePath in allSrcImgFiles)
         {
-            Con.WriteLine($"Loading " + page.FilePath);
+            int currentPageNumber = pageNumber; // ★ クロージャ対策
+            string currentFilePath = filePath;
+        
             await semaphore.WaitAsync().ConfigureAwait(false);
-            try
+        
+            tasks.Add(Task.Run(async () =>
             {
-                // 1ページの画像読み込み
-                using var srcImage = await SixLabors.ImageSharp.Image.LoadAsync<Rgba32>(page.FilePath);
-
-                // ---------------------------------------------------------
-                //  (1.5) 画像をターゲットサイズ (4960x7016) にフィットさせる
-                //         ・縦横同倍率で拡大 / 縮小
-                //         ・余った領域は紙色で塗りつぶし
-                // ---------------------------------------------------------
-                // ★ ここに挿入 ★
-
-                // 元画像をフィットさせるスケール (縦横同倍率)
-                double scale = Math.Min(
-                    (double)internalHighResImgWidth / srcImage.Width,
-                    (double)internalHighResImgHeight / srcImage.Height);
-
-                int fittedW = (int)Math.Round(srcImage.Width * scale);
-                int fittedH = (int)Math.Round(srcImage.Height * scale);
-
-                /*
-                Rgba32 paperColor = EstimatePaperColor(srcImage);
-
-                // 元画像をスケール変換
-                srcImage.Mutate(ctx =>
+                try
                 {
-                    //ctx.Resize(new ResizeOptions
-                    //{
-                    //    Size = new SixLabors.ImageSharp.Size(fittedW, fittedH),
-                    //    Mode = ResizeMode.BoxPad,      // 縦横比維持でフィット
-                    //    Sampler = KnownResamplers.Lanczos3,
-                    //    PremultiplyAlpha = true
-                    //});
-                    ctx.Resize(fittedW, fittedH, KnownResamplers.Lanczos3);
-                });
-
-                // スケール後の画像を、ターゲットサイズのキャンバスへ貼り付ける
-                using var newImage = new Image<Rgba32>(TargetWidth, TargetHeight, paperColor);
-                int offsetX = (TargetWidth - fittedW) / 2;
-                int offsetY = (TargetHeight - fittedH) / 2;
-
-                newImage.Mutate(ctx =>
-                {
-                    ctx.DrawImage(srcImage, new SixLabors.ImageSharp.Point(offsetX, offsetY), 1f);
-                });*/
-
-                using var newImage = ResizeAndMakePaddingWithNaturalPaperColor(srcImage,
-                                              internalHighResImgWidth, internalHighResImgHeight);
-
-
-                // ---------------------------------------------------------
-                // ここまで追加
-                // ---------------------------------------------------------
-
-
-                // 傾き補正(OpenCvSharp使用)
-                using var deskewedImage = noDeskew == false ? (await DeskewImageWithOpenCvAsync(newImage)) : newImage.Clone();
-
-                // deskew後ファイルを tmpDir に保存
-                string tempFilePath = PP.Combine(tmpDir, $"deskew_{page.PageNumber:D4}.png");
-                await deskewedImage.SaveAsync(tempFilePath, new PngEncoder());
-
-                // カラー統計情報抽出
-                var stats = CalculateColorStats(deskewedImage);
-                stats.PageNumber = page.PageNumber;
-
-                if ((page.PageNumber % 2) == 0)
-                {
-                    colorStatsList_Even.Add(stats);
+                    Con.WriteLine($"Loading " + currentFilePath);
+        
+                    // 1ページの画像読み込み
+                    using var srcImage =
+                        await SixLabors.ImageSharp.Image.LoadAsync<Rgba32>(currentFilePath);
+        
+                    // ---------------------------------------------------------
+                    // (1.5) 画像をターゲットサイズにフィット
+                    // ---------------------------------------------------------
+                    using var newImage =
+                        ResizeAndMakePaddingWithNaturalPaperColor(
+                            srcImage,
+                            internalHighResImgWidth,
+                            internalHighResImgHeight);
+        
+                    // 傾き補正(OpenCvSharp使用)
+                    using var deskewedImage =
+                        noDeskew == false
+                            ? (await DeskewImageWithOpenCvAsync(newImage))
+                            : newImage.Clone();
+        
+                    // deskew後ファイルを tmpDir に保存
+                    string tempFilePath =
+                        PP.Combine(tmpDir, $"deskew_{currentPageNumber:D4}.png");
+        
+                    await deskewedImage.SaveAsync(tempFilePath, new PngEncoder());
+        
+                    // カラー統計情報抽出
+                    var stats = CalculateColorStats(deskewedImage);
+                    stats.PageNumber = currentPageNumber;
+        
+                    if ((currentPageNumber & 1) == 0)
+                    {
+                        colorStatsList_Even.Add(stats);
+                    }
+                    else
+                    {
+                        colorStatsList_Odd.Add(stats);
+                    }
                 }
-                else
+                catch (Exception ex)
                 {
-                    colorStatsList_Odd.Add(stats);
+                    ex._Error();
+                    throw;
                 }
-            }
-            catch (Exception ex)
-            {
-                ex._Error();
-                throw;
-            }
-            finally
-            {
-                semaphore.Release();
-            }
-        }));
+                finally
+                {
+                    semaphore.Release();
+                }
+            }));
+        
+            pageNumber++;
+        }
+        
+        // ★ ここでまとめて待つ
+        await Task.WhenAll(tasks);
 
         // ---------------------------------------------------------
         // (3) カラー統計情報から外れ値除外し、
