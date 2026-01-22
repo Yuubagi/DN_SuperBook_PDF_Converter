@@ -1660,62 +1660,69 @@ public static class SuperPdfUtil
         var oddBoundingBoxes = new ConcurrentBag<PageBoundingBox>();
         var evenBoundingBoxes = new ConcurrentBag<PageBoundingBox>();
 
-        await Task.WhenAll(pageInfos.Select(async page =>
+        var tasks = new List<Task>();
+
+        foreach (var page in pageInfos)
         {
-            await semaphore.WaitAsync().ConfigureAwait(false);
-            try
+            await semaphore.WaitAsync(cancel).ConfigureAwait(false);
+        
+            var task = Task.Run(async () =>
             {
-                Con.WriteLine($"Processing " + page.FilePath);
-
-                // deskew後ファイル読み込み
-                string deskewFilePath = PP.Combine(tmpDir, $"deskew_{page.PageNumber:D4}.png");
-                //if (!File.Exists(deskewFilePath))
-                //{
-                //    return;
-                //}
-                using var deskewedImage = await SixLabors.ImageSharp.Image.LoadAsync<Rgba32>(deskewFilePath);
-
-                // グローバルカラー補正を適用
-                if ((page.PageNumber % 2) == 0)
+                try
                 {
-                    ApplyGlobalColorAdjustment(deskewedImage, globalColorParam_Even);
-                }
-                else
-                {
-                    ApplyGlobalColorAdjustment(deskewedImage, globalColorParam_Odd);
-                }
-
-                // 文字領域のBBox検出
-                var bbox = DetectTextBoundingBox(deskewedImage);
-                if (page.IsOdd)
-                {
-                    oddBoundingBoxes.Add(new PageBoundingBox
+                    Con.WriteLine($"Processing " + page.FilePath);
+        
+                    string deskewFilePath =
+                        PP.Combine(tmpDir, $"deskew_{page.PageNumber:D4}.png");
+        
+                    using var deskewedImage =
+                        await SixLabors.ImageSharp.Image
+                            .LoadAsync<Rgba32>(deskewFilePath, cancel);
+        
+                    if ((page.PageNumber & 1) == 0)
+                        ApplyGlobalColorAdjustment(deskewedImage, globalColorParam_Even);
+                    else
+                        ApplyGlobalColorAdjustment(deskewedImage, globalColorParam_Odd);
+        
+                    var bbox = DetectTextBoundingBox(deskewedImage);
+        
+                    var bb = new PageBoundingBox
                     {
                         PageNumber = page.PageNumber,
                         SrcPath = page.FilePath,
                         BoundingBox = bbox
-                    });
-                }
-                else
-                {
-                    evenBoundingBoxes.Add(new PageBoundingBox
+                    };
+        
+                    // ★ スレッドセーフに追加
+                    lock (oddBoundingBoxes)
                     {
-                        PageNumber = page.PageNumber,
-                        SrcPath = page.FilePath,
-                        BoundingBox = bbox
-                    });
+                        if ((page.PageNumber & 1) == 1)
+                            oddBoundingBoxes.Add(bb);
+                        else
+                            evenBoundingBoxes.Add(bb);
+                    }
+        
+                    string colorAdjustedFilePath =
+                        PP.Combine(tmpDir, $"coloradj_{page.PageNumber:D4}.png");
+        
+                    page.FilePathColorAdj = colorAdjustedFilePath;
+        
+                    await deskewedImage.SaveAsync(
+                        colorAdjustedFilePath,
+                        new PngEncoder(),
+                        cancel
+                    );
                 }
-
-                // 補正済み画像を tmpDir に保存 (最終拡大前段階)
-                string colorAdjustedFilePath = PP.Combine(tmpDir, $"coloradj_{page.PageNumber:D4}.png");
-                page.FilePathColorAdj = colorAdjustedFilePath;
-                await deskewedImage.SaveAsync(colorAdjustedFilePath, new PngEncoder());
-            }
-            finally
-            {
-                semaphore.Release();
-            }
-        }));
+                finally
+                {
+                    semaphore.Release();
+                }
+            }, cancel);
+        
+            tasks.Add(task);
+        }
+        
+        await Task.WhenAll(tasks);
 
         // ページ番号 OCR
         PnOcrLibBookMetaData? pnOcrResult = null;
